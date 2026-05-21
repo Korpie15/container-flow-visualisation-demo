@@ -14,11 +14,21 @@ def generate_sample_data():
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     period_start = today - timedelta(days=90)
 
-    vessels = [
-        "MSC AURORA", "EVER FORTUNE", "OOCL PACIFIC", "MAERSK SATURN",
-        "CMA MISTRAL", "HMM OLYMPIA", "PIL NAVIGATOR", "ANL WYONG",
-        "ONE HARMONY", "COSCO STAR",
-    ]
+    # Three tiers: large mainline vessels, medium regional, small feeder.
+    _vessel_tiers = {
+        "MSC AURORA":    "large",
+        "EVER FORTUNE":  "large",
+        "MAERSK SATURN": "large",
+        "OOCL PACIFIC":  "medium",
+        "CMA MISTRAL":   "medium",
+        "HMM OLYMPIA":   "medium",
+        "ONE HARMONY":   "medium",
+        "PIL NAVIGATOR": "small",
+        "ANL WYONG":     "small",
+        "COSCO STAR":    "small",
+    }
+    vessels = list(_vessel_tiers.keys())
+
     categories = ["IMPORT", "EXPORT", "TRANSHIP", "EMPTY"]
     cat_weights = np.array([0.45, 0.35, 0.12, 0.08])
 
@@ -81,12 +91,32 @@ def generate_sample_data():
         })
 
     for vessel in vessels:
-        n_calls = int(rng.integers(1, 3))
+        tier = _vessel_tiers[vessel]
+
+        if tier == "large":
+            n_calls            = int(rng.integers(2, 4))    # 2-3 calls
+            dis_lo,  dis_hi   = 800,  1600
+            load_lo, load_hi  = 500,  1100
+            sp_lo,   sp_hi    = 20,   40
+            churn_lo, churn_hi = 8,   16
+        elif tier == "medium":
+            n_calls            = int(rng.integers(1, 3))    # 1-2 calls
+            dis_lo,  dis_hi   = 150,  420
+            load_lo, load_hi  = 100,  300
+            sp_lo,   sp_hi    = 10,   25
+            churn_lo, churn_hi = 3,   8
+        else:                                                # small feeder
+            n_calls            = int(rng.integers(1, 3))    # 1-2 calls
+            dis_lo,  dis_hi   = 40,   130
+            load_lo, load_hi  = 25,   95
+            sp_lo,   sp_hi    = 5,    15
+            churn_lo, churn_hi = 1,   4
+
         for _ in range(n_calls):
             call_day = period_start + timedelta(days=int(rng.integers(0, 90)))
 
-            # Discharge: Ship → Block → [optional Block] → Truck/Rail
-            for _ in range(int(rng.integers(50, 130))):
+            # Discharge: Ship → Block → [optional re-handle] → [X-ray] → Truck/Rail
+            for _ in range(int(rng.integers(dis_lo, dis_hi + 1))):
                 k = ctr_key; ctr_key += 1
                 no = rand_ctr_no(); cat = rand_cat()
                 blk1, row1 = rand_yard()
@@ -95,7 +125,7 @@ def generate_sample_data():
                 add(k, no, vessel, cat, t0,
                     "Ship", "", "", f"Block {blk1}", blk1, row1)
 
-                if rng.random() < 0.20:
+                if rng.random() < 0.22:
                     blk2, row2 = rand_yard()
                     t1 = t0 + timedelta(hours=float(rng.uniform(6, 24)))
                     add(k, no, vessel, cat, t1,
@@ -107,11 +137,11 @@ def generate_sample_data():
                     blk_f, row_f = blk1, row1
                     t_gate = t0 + timedelta(hours=float(rng.uniform(18, 72)))
 
-                # ~5% of discharge containers are sent out by truck for X-ray scanning,
+                # ~1% of discharge containers are sent out for X-ray scanning,
                 # then returned to a yard block before final gate-out.
                 # Produces the consecutive target_raw='Truck'/source_raw='Truck' pattern
                 # that the X-Ray Trips analytics section detects.
-                if rng.random() < 0.05:
+                if rng.random() < 0.01:
                     blk_xr, row_xr = rand_yard()
                     t_xr_out = t_gate
                     t_xr_in  = t_xr_out + timedelta(hours=float(rng.uniform(2, 8)))
@@ -126,8 +156,8 @@ def generate_sample_data():
                 add(k, no, vessel, cat, t_gate,
                     f"Block {blk_f}", blk_f, row_f, gate, "", "")
 
-            # Load: Truck/Rail → Block → [optional Block] → Ship
-            for _ in range(int(rng.integers(35, 110))):
+            # Load: Truck/Rail → Block → [optional re-handle] → Ship
+            for _ in range(int(rng.integers(load_lo, load_hi + 1))):
                 k = ctr_key; ctr_key += 1
                 no = rand_ctr_no(); cat = rand_cat()
                 blk1, row1 = rand_yard()
@@ -153,7 +183,7 @@ def generate_sample_data():
                     f"Block {blk_f}", blk_f, row_f, "Ship", "", "")
 
             # Special-block flows (ISA, Rail Block, Cargo Link)
-            for _ in range(int(rng.integers(8, 20))):
+            for _ in range(int(rng.integers(sp_lo, sp_hi + 1))):
                 k = ctr_key; ctr_key += 1
                 no = rand_ctr_no(); cat = rand_cat()
                 sp_blk, sp_row = rand_special()
@@ -182,6 +212,29 @@ def generate_sample_data():
                         f"Block {blk1}", blk1, row1)
                     add(k, no, vessel, cat, t2,
                         f"Block {blk1}", blk1, row1, "Ship", "", "")
+
+            # Multi-step churning containers (customs holds, wrong-bay restacks, strip/stuff).
+            # Each container is re-handled 11–16 times block-to-block, producing journey chains
+            # of 13–18 steps in the Sankey — the "boxes that move many times" visible at the right
+            # tail of the step-sequence cards.
+            for _ in range(int(rng.integers(churn_lo, churn_hi + 1))):
+                k = ctr_key; ctr_key += 1
+                no = rand_ctr_no(); cat = rand_cat()
+                n_rehandles = int(rng.integers(11, 17))
+                blk, row = rand_yard()
+                t = call_day + timedelta(hours=float(rng.uniform(0, 6)))
+
+                add(k, no, vessel, cat, t, "Ship", "", "", f"Block {blk}", blk, row)
+                for _ in range(n_rehandles):
+                    blk2, row2 = rand_yard()
+                    t = t + timedelta(hours=float(rng.uniform(3, 20)))
+                    add(k, no, vessel, cat, t,
+                        f"Block {blk}", blk, row,
+                        f"Block {blk2}", blk2, row2)
+                    blk, row = blk2, row2
+                t += timedelta(hours=float(rng.uniform(6, 24)))
+                gate = "Truck" if rng.random() < 0.72 else "Rail"
+                add(k, no, vessel, cat, t, f"Block {blk}", blk, row, gate, "", "")
 
     df = pd.DataFrame(rows)
     df["time"] = pd.to_datetime(df["time"])
