@@ -93,9 +93,22 @@ st.sidebar.header("Filter Controls")
 
 today         = datetime.date.today()
 default_start = today - datetime.timedelta(days=30)
+
+if "demo_date_range" not in st.session_state:
+    st.session_state["demo_date_range"] = (default_start, today)
+
+st.sidebar.caption("Quick select:")
+_pc1, _pc2, _pc3 = st.sidebar.columns(3)
+if _pc1.button("7 Days", use_container_width=True):
+    st.session_state["demo_date_range"] = (today - datetime.timedelta(days=7), today)
+if _pc2.button("30 Days", use_container_width=True):
+    st.session_state["demo_date_range"] = (today - datetime.timedelta(days=30), today)
+if _pc3.button("90 Days", use_container_width=True):
+    st.session_state["demo_date_range"] = (today - datetime.timedelta(days=90), today)
+
 selected_date_range = st.sidebar.date_input(
     "Select Date Range",
-    value=(default_start, today),
+    key="demo_date_range",
     min_value=today - datetime.timedelta(days=90),
     max_value=today,
 )
@@ -148,6 +161,34 @@ flow_type         = st.sidebar.selectbox(
     "Select Flow Direction",
     ["Discharge from Ship", "Load onto Ship", "All Flows"],
 )
+
+_transport_modes = ["Ship", "Truck", "Rail", "Cargo Link", "ISA"]
+
+_via_node_options = [
+    "Ship", "Truck", "Rail",
+    "Berth 6", "Berth 7", "Berth 8", "Berth 9",
+    "Rail Block", "ISA", "Cargo Link", "RE", "RW", "Pondus",
+]
+
+with st.sidebar.expander("Via Node Filter", expanded=False):
+    st.caption("Show only containers that passed through the selected locations. Nothing checked = show all.")
+    selected_via_nodes = [
+        node for node in _via_node_options
+        if st.checkbox(node, value=False, key=f"via_node_{node}")
+    ]
+
+with st.sidebar.expander("Entry / Exit Node Filters", expanded=False):
+    st.markdown("**Entry Nodes**")
+    selected_entry_modes = [
+        mode for mode in _transport_modes
+        if st.checkbox(mode, value=True, key=f"entry_mode_{mode}")
+    ]
+    st.markdown("**Exit Nodes**")
+    selected_exit_modes = [
+        mode for mode in _transport_modes
+        if st.checkbox(mode, value=True, key=f"exit_mode_{mode}")
+    ]
+
 selected_categories = st.sidebar.multiselect(
     "Select Cargo Category",
     options=categories,
@@ -378,6 +419,31 @@ if not df_raw.empty:
                 df_processed["target_node"].str.endswith(": Ship")
             ]["ctr_key"].unique()
             df_processed = df_processed[df_processed["ctr_key"].isin(export_keys)]
+
+        if selected_entry_modes and len(selected_entry_modes) < len(_transport_modes):
+            _first_src = (
+                df_processed.sort_values('move_seq')
+                .groupby('ctr_key')['source_clean']
+                .first()
+            )
+            _entry_keys = _first_src[_first_src.isin(selected_entry_modes)].index
+            df_processed = df_processed[df_processed['ctr_key'].isin(_entry_keys)]
+
+        if selected_exit_modes and len(selected_exit_modes) < len(_transport_modes):
+            _last_tgt = (
+                df_processed.sort_values('move_seq')
+                .groupby('ctr_key')['target_clean']
+                .last()
+            )
+            _exit_keys = _last_tgt[_last_tgt.isin(selected_exit_modes)].index
+            df_processed = df_processed[df_processed['ctr_key'].isin(_exit_keys)]
+
+        if selected_via_nodes:
+            _via_keys = df_processed[
+                df_processed['source_clean'].isin(selected_via_nodes) |
+                df_processed['target_clean'].isin(selected_via_nodes)
+            ]['ctr_key'].unique()
+            df_processed = df_processed[df_processed['ctr_key'].isin(_via_keys)]
 
     if not df_processed.empty:
         df_grouped  = df_processed.groupby(["source_node", "target_node"]).size().reset_index(name="move_count")
@@ -819,13 +885,54 @@ if not df_raw.empty:
                     st.dataframe(pd.DataFrame({'Location': target_counts.index, 'Containers': target_counts.values}), use_container_width=True, hide_index=True)
 
                 st.markdown("---")
+                st.subheader("High-Move Containers")
+                st.write("Containers that made an unusually high number of moves within the current filtered view.")
+
+                _min_moves = st.number_input(
+                    "Minimum moves threshold", min_value=1, value=5, step=1,
+                    key="min_moves_threshold",
+                )
+
+                _moves_per_ctr = (
+                    df_processed.groupby('ctr_key')['move_seq']
+                    .max()
+                    .rename('Move Count')
+                    .reset_index()
+                )
+                _high_movers = _moves_per_ctr[_moves_per_ctr['Move Count'] >= _min_moves]
+
+                if not _high_movers.empty:
+                    _ctr_meta = (
+                        df_processed.groupby('ctr_key')[['ctr_no', 'ship_id', 'cargo_category']]
+                        .first()
+                        .reset_index()
+                    )
+                    _high_movers = (
+                        _high_movers
+                        .merge(_ctr_meta, on='ctr_key')
+                        .sort_values('Move Count', ascending=False)
+                        .rename(columns={
+                            'ctr_key': 'Container Key',
+                            'ctr_no': 'Container No',
+                            'ship_id': 'Vessel',
+                            'cargo_category': 'Cargo Category',
+                        })
+                        [['Container Key', 'Container No', 'Vessel', 'Cargo Category', 'Move Count']]
+                    )
+                    st.metric("Containers Meeting Threshold", f"{len(_high_movers):,}")
+                    st.dataframe(_high_movers, use_container_width=True, hide_index=True)
+                else:
+                    st.info(f"No containers found with {_min_moves} or more moves.")
+
+                st.markdown("---")
                 st.subheader("X-Ray Trips")
                 st.write(
-                    "Containers that made a truck out-and-back trip via TIP (e.g. Block H → TIP → Block E). "
+                    "Containers that made a truck out-and-back trip via TIP (e.g. Block H → TIP → TIP → Block E). "
                     "Each consecutive Truck-out / Truck-in pair counts as one X-ray trip."
                 )
 
-                _rs = df_raw.sort_values(['ctr_key', 'time'])
+                _filtered_keys = df_processed['ctr_key'].unique()
+                _rs = df_raw[df_raw['ctr_key'].isin(_filtered_keys)].sort_values(['ctr_key', 'time'])
                 _rs = _rs.assign(
                     _next_src=_rs.groupby('ctr_key')['source_raw'].shift(-1)
                 )
